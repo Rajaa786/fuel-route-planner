@@ -94,6 +94,36 @@
           }
         },
         {
+          "name": "City names only, no state (Chicago -> Dallas)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "The state and the comma are optional for large cities. Same plan as 'Chicago, IL' -> 'Dallas, TX', still zero geocoding calls.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Chicago&finish=Dallas",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago"
+                },
+                {
+                  "key": "finish",
+                  "value": "Dallas"
+                }
+              ]
+            }
+          }
+        },
+        {
           "name": "Chicago -> Dallas, strictly cheapest (stop_penalty=0)",
           "request": {
             "method": "GET",
@@ -315,6 +345,36 @@
           }
         },
         {
+          "name": "422 ambiguous city (Springfield)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Several comparable cities share the name. The response lists them instead of guessing; no external call is made.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Springfield&finish=Dallas, TX",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Springfield"
+                },
+                {
+                  "key": "finish",
+                  "value": "Dallas, TX"
+                }
+              ]
+            }
+          }
+        },
+        {
           "name": "422 outside service area",
           "request": {
             "method": "GET",
@@ -335,6 +395,36 @@
                 {
                   "key": "start",
                   "value": "Toronto, ON"
+                },
+                {
+                  "key": "finish",
+                  "value": "Dallas, TX"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "422 foreign city (Mexico City)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "A foreign place is rejected, not swapped for a US namesake.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Mexico City&finish=Dallas, TX",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Mexico City"
                 },
                 {
                   "key": "finish",
