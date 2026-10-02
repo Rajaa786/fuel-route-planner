@@ -1,0 +1,400 @@
+{
+  "info": {
+    "name": "Fuel Route Planner",
+    "description": "Route, cost-optimal fuel stops and total fuel cost between two US locations.\n\nSet the `base_url` collection variable (default http://127.0.0.1:8000).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "description": "Ready once fuel data is loaded; reports the station count.",
+        "url": {
+          "raw": "{{base_url}}/health/",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "health",
+            ""
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Plans",
+      "item": [
+        {
+          "name": "New York -> Los Angeles (multiple stops)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Coast to coast: several fuel-ups. Send twice: the second call makes 0 external API calls (see meta.external_api_calls).",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=New York, NY&finish=Los Angeles, CA",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "New York, NY"
+                },
+                {
+                  "key": "finish",
+                  "value": "Los Angeles, CA"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Chicago -> Dallas",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Chicago, IL&finish=Dallas, TX",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago, IL"
+                },
+                {
+                  "key": "finish",
+                  "value": "Dallas, TX"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Chicago -> Dallas, strictly cheapest (stop_penalty=0)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Provably cheapest fuel, however many stops. Compare with the default plan.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Chicago, IL&finish=Dallas, TX&stop_penalty=0",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago, IL"
+                },
+                {
+                  "key": "finish",
+                  "value": "Dallas, TX"
+                },
+                {
+                  "key": "stop_penalty",
+                  "value": "0"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Dallas -> Houston (within range, no stop needed)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "No stop is required; total_fuel_cost still prices the fuel burned and optional_top_up names the cheapest station on the way.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Dallas, TX&finish=Houston, TX",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Dallas, TX"
+                },
+                {
+                  "key": "finish",
+                  "value": "Houston, TX"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Coordinates: Seattle -> Miami",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "lat,lon inputs need no geocoding.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=47.6062,-122.3321&finish=25.7617,-80.1918",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "47.6062,-122.3321"
+                },
+                {
+                  "key": "finish",
+                  "value": "25.7617,-80.1918"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Street address (uses the fallback geocoder once)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "The only case that makes a second external call; the result is cached.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=1600 Pennsylvania Ave NW, Washington, DC&finish=Atlanta, GA",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "1600 Pennsylvania Ave NW, Washington, DC"
+                },
+                {
+                  "key": "finish",
+                  "value": "Atlanta, GA"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Map (open in a browser)",
+      "item": [
+        {
+          "name": "Map: New York -> Los Angeles",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "HTML page. Open the URL in a browser, or use the map_url field of any plan response.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/map/?start=New York, NY&finish=Los Angeles, CA",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                "map",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "New York, NY"
+                },
+                {
+                  "key": "finish",
+                  "value": "Los Angeles, CA"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Errors",
+      "item": [
+        {
+          "name": "400 missing parameter",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Chicago, IL",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago, IL"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "422 unknown location",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Qwertyuiop, ZZ&finish=Dallas, TX",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Qwertyuiop, ZZ"
+                },
+                {
+                  "key": "finish",
+                  "value": "Dallas, TX"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "422 outside service area",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Toronto, ON&finish=Dallas, TX",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Toronto, ON"
+                },
+                {
+                  "key": "finish",
+                  "value": "Dallas, TX"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "422 no feasible fuel plan (data gap on the West Coast)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "The fuel file has almost no California stations, so this stretch exceeds the vehicle's range.",
+            "url": {
+              "raw": "{{base_url}}/api/v1/route-plan/?start=Los Angeles, CA&finish=Seattle, WA",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "route-plan",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Los Angeles, CA"
+                },
+                {
+                  "key": "finish",
+                  "value": "Seattle, WA"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "OpenAPI schema",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "description": "",
+        "url": {
+          "raw": "{{base_url}}/api/schema/",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "schema",
+            ""
+          ],
+          "query": []
+        }
+      }
+    }
+  ]
+}
