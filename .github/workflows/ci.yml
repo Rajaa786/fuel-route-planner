@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -q
+      - name: Django deployment checks
+        env:
+          DJANGO_SECRET_KEY: ${{ github.sha }}-ci-only-not-a-real-secret-key-0123456789
+          DJANGO_BEHIND_TLS_PROXY: "True"
+        run: uv run python manage.py check --deploy --fail-level WARNING
+      - name: No model changes without a migration
+        env:
+          DJANGO_SECRET_KEY: ci
+        run: uv run python manage.py makemigrations --check --dry-run
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t fuel-route-planner .
+      - name: Container serves /health/
+        run: |
+          docker run -d --name app -p 8000:8000 -e DJANGO_SECRET_KEY=ci-only fuel-route-planner
+          for attempt in $(seq 1 20); do
+            curl -fsS http://localhost:8000/health/ && exit 0
+            sleep 1
+          done
+          docker logs app
+          exit 1
