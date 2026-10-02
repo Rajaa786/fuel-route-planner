@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if plan %}{{ plan.start.name }} to {{ plan.finish.name }}{% else %}Route map{% endif %} | Fuel Route Planner</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
+  <style nonce="{{ csp_nonce }}">
+    :root { --ink: #16202a; --muted: #5b6875; --line: #dfe5ea; --accent: #0b6bcb; --fuel: #d9480f; --ok: #2b8a3e; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); }
+    #panel { width: 380px; max-width: 100%; overflow-y: auto; padding: 20px; border-right: 1px solid var(--line); background: #fff; }
+    #map { flex: 1; min-height: 320px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    h2 { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 22px 0 8px; }
+    .sub { color: var(--muted); margin: 0; }
+    .total { font-size: 30px; font-weight: 700; margin: 14px 0 2px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin: 12px 0 0; }
+    .grid dt { color: var(--muted); font-size: 12px; }
+    .grid dd { margin: 0; font-weight: 600; }
+    ol.stops { list-style: none; margin: 0; padding: 0; }
+    ol.stops li { display: grid; grid-template-columns: 28px 1fr auto; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+    .badge { width: 24px; height: 24px; border-radius: 50%; background: var(--fuel); color: #fff; font-weight: 700; font-size: 12px; display: grid; place-items: center; }
+    .badge.optional { background: var(--muted); }
+    .name { font-weight: 600; }
+    .small { color: var(--muted); font-size: 12px; }
+    .cost { text-align: right; white-space: nowrap; font-weight: 600; }
+    .note { color: var(--muted); font-size: 12px; margin: 6px 0 0; padding-left: 16px; }
+    .warning, .error { border-radius: 6px; padding: 10px 12px; margin: 12px 0 0; }
+    .warning { background: #fff4e6; color: #7c3a00; }
+    .error { background: #fff0f0; color: #a51111; font-weight: 600; }
+    .stop-pin { background: var(--fuel); color: #fff; border: 2px solid #fff; border-radius: 50%; font: 700 12px/20px system-ui, sans-serif; text-align: center; box-shadow: 0 1px 4px rgba(0, 0, 0, .4); }
+    .stop-pin.optional { background: var(--muted); }
+    .end-pin { background: var(--ok); border: 2px solid #fff; border-radius: 4px; box-shadow: 0 1px 4px rgba(0, 0, 0, .4); }
+    .end-pin.finish { background: var(--ink); }
+    @media (max-width: 760px) { body { flex-direction: column-reverse; } #panel { width: 100%; border-right: 0; border-top: 1px solid var(--line); max-height: 50%; } }
+  </style>
+</head>
+<body>
+  <aside id="panel">
+    {% if plan %}
+      <h1>{{ plan.start.name }} &rarr; {{ plan.finish.name }}</h1>
+      <p class="sub">{{ plan.route.distance_miles }} miles &middot; about {{ plan.route.duration_hours }} h driving</p>
+
+      <p class="total">${{ plan.summary.total_fuel_cost|floatformat:2 }}</p>
+      <p class="sub">total fuel cost for {{ plan.summary.trip_fuel_gallons|floatformat:1 }} gal at {{ plan.assumptions.miles_per_gallon|floatformat:0 }} mpg</p>
+
+      <dl class="grid">
+        <div><dt>Bought at stops</dt><dd>${{ plan.summary.fuel_purchased_cost|floatformat:2 }} ({{ plan.summary.gallons_purchased|floatformat:1 }} gal)</dd></div>
+        <div><dt>From starting tank</dt><dd>${{ plan.summary.starting_fuel_cost_estimate|floatformat:2 }} ({{ plan.summary.starting_fuel_gallons_used|floatformat:1 }} gal)</dd></div>
+        <div><dt>Fuel stops</dt><dd>{{ plan.summary.fuel_stops }}</dd></div>
+        <div><dt>Reference price</dt><dd>${{ plan.summary.reference_price_per_gallon|floatformat:3 }}/gal</dd></div>
+      </dl>
+
+      {% for warning in plan.warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
+
+      <h2>Fuel stops</h2>
+      <ol class="stops">
+        {% for stop in plan.fuel_stops %}
+          <li>
+            <span class="badge">{{ stop.stop }}</span>
+            <span>
+              <span class="name">{{ stop.name }}</span><br>
+              <span class="small">{{ stop.city }}, {{ stop.state }} &middot; mile {{ stop.mile_marker|floatformat:0 }} &middot; {{ stop.address }}</span>
+            </span>
+            <span class="cost">${{ stop.cost|floatformat:2 }}<br><span class="small">{{ stop.gallons|floatformat:1 }} gal @ ${{ stop.price_per_gallon|floatformat:3 }}</span></span>
+          </li>
+        {% empty %}
+          <li>
+            <span class="badge optional">&ndash;</span>
+            <span>No stop required: the trip is within range of the starting tank.</span>
+            <span></span>
+          </li>
+          {% if plan.optional_top_up %}
+            <li>
+              <span class="badge optional">?</span>
+              <span>
+                <span class="name">{{ plan.optional_top_up.name }}</span><br>
+                <span class="small">Cheapest on route &middot; {{ plan.optional_top_up.city }}, {{ plan.optional_top_up.state }} &middot; mile {{ plan.optional_top_up.mile_marker|floatformat:0 }}</span>
+              </span>
+              <span class="cost">${{ plan.optional_top_up.price_per_gallon|floatformat:3 }}<br><span class="small">per gal</span></span>
+            </li>
+          {% endif %}
+        {% endfor %}
+      </ol>
+
+      <h2>Assumptions</h2>
+      {% for note in plan.assumptions.notes %}<p class="note">{{ note }}</p>{% endfor %}
+    {% else %}
+      <h1>Route map</h1>
+      <p class="error">{{ error }}</p>
+      <p class="sub">Expected: <code>?start=Chicago, IL&amp;finish=Dallas, TX</code></p>
+    {% endif %}
+  </aside>
+  <div id="map"></div>
+
+  {% if plan %}
+    {{ plan|json_script:"plan-data" }}
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"
+            nonce="{{ csp_nonce }}"></script>
+    <script nonce="{{ csp_nonce }}">
+      (function () {
+        "use strict";
+        var plan = JSON.parse(document.getElementById("plan-data").textContent);
+        var map = L.map("map", { preferCanvas: true });
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 18,
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        // GeoJSON is [lon, lat]; Leaflet wants [lat, lon].
+        var path = plan.route.geometry.coordinates.map(function (c) { return [c[1], c[0]]; });
+        var line = L.polyline(path, { color: "#0b6bcb", weight: 5, opacity: 0.85 }).addTo(map);
+        map.fitBounds(line.getBounds(), { padding: [30, 30] });
+
+        // Popups are built from DOM nodes with textContent: station names come from a CSV
+        // and place names from user input, so nothing is ever inserted as HTML.
+        function popup(lines) {
+          var box = document.createElement("div");
+          lines.forEach(function (text, index) {
+            var row = document.createElement(index === 0 ? "strong" : "div");
+            row.textContent = text;
+            box.appendChild(row);
+          });
+          return box;
+        }
+        function pin(className, label, size) {
+          return L.divIcon({ className: className, html: label, iconSize: [size, size] });
+        }
+        function money(value, digits) { return "$" + Number(value).toFixed(digits); }
+
+        L.marker(path[0], { icon: pin("end-pin", "", 16) }).addTo(map)
+          .bindPopup(popup(["Start", plan.start.name]));
+        L.marker(path[path.length - 1], { icon: pin("end-pin finish", "", 16) }).addTo(map)
+          .bindPopup(popup(["Finish", plan.finish.name]));
+
+        plan.fuel_stops.forEach(function (stop) {
+          L.marker([stop.latitude, stop.longitude], { icon: pin("stop-pin", String(stop.stop), 24) })
+            .addTo(map)
+            .bindPopup(popup([
+              stop.stop + ". " + stop.name,
+              stop.city + ", " + stop.state + " (" + stop.address + ")",
+              "Mile " + stop.mile_marker.toFixed(0) + " of " + plan.route.distance_miles.toFixed(0),
+              stop.gallons.toFixed(1) + " gal at " + money(stop.price_per_gallon, 3) + " = " + money(stop.cost, 2)
+            ]));
+        });
+
+        if (plan.optional_top_up) {
+          var station = plan.optional_top_up;
+          L.marker([station.latitude, station.longitude], { icon: pin("stop-pin optional", "?", 24) })
+            .addTo(map)
+            .bindPopup(popup([
+              "Optional: " + station.name,
+              station.city + ", " + station.state,
+              "Cheapest on route: " + money(station.price_per_gallon, 3) + "/gal"
+            ]));
+        }
+      })();
+    </script>
+  {% endif %}
+</body>
+</html>
