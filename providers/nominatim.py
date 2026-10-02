@@ -5,6 +5,7 @@ street addresses. See https://operations.osmfoundation.org/policies/nominatim/.
 """
 
 import math
+import re
 import threading
 import time
 
@@ -17,6 +18,8 @@ from providers.base import (
     ProviderUnavailableError,
 )
 from providers.http import get_json
+
+_ZIP_CODE = re.compile(r"^\d{5}(-\d{4})?$")
 
 
 class NominatimGeocoder:
@@ -34,8 +37,25 @@ class NominatimGeocoder:
         self._next_slot = 0.0
 
     def geocode(self, query: str) -> GeocodeHit | None:
+        """Best match for free text.
+
+        The search is deliberately *not* restricted to the US: restricted, it
+        answers "Mexico City" with some street in Pittsburgh. Unrestricted, it
+        returns the real Mexico City and its country code, which lets the caller
+        reject it honestly. ZIP codes are the exception, being meaningless abroad.
+        """
+        if _ZIP_CODE.match(query.strip()):
+            return self._search({"postalcode": query.strip()[:5], "countrycodes": "us"}, query)
+        return self._search({"q": query}, query)
+
+    def geocode_address(self, street: str, city: str, state: str) -> GeocodeHit | None:
+        """Structured lookup, so the city is never misread as part of the street."""
+        params = {"street": street, "city": city, "state": state, "countrycodes": "us"}
+        return self._search(params, f"{street}, {city}, {state}")
+
+    def _search(self, criteria: dict[str, str], fallback_label: str) -> GeocodeHit | None:
         self._wait_for_slot()
-        params = {"q": query, "format": "jsonv2", "limit": 1, "countrycodes": "us"}
+        params = {**criteria, "format": "jsonv2", "limit": 1, "addressdetails": 1}
         status, payload = get_json(
             self._client, f"{self._base_url}/search", params, provider="Nominatim"
         )
@@ -46,10 +66,17 @@ class NominatimGeocoder:
         try:
             hit = payload[0]
             coordinate = Coordinate(latitude=float(hit["lat"]), longitude=float(hit["lon"]))
-            label = str(hit.get("display_name") or query)
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            label = str(hit.get("display_name") or fallback_label)
+            country_code = (hit.get("address") or {}).get("country_code")
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as exc:
             raise ProviderUnavailableError("Nominatim returned an unexpected payload.") from exc
-        return GeocodeHit(coordinate=coordinate, label=label)
+        if not (math.isfinite(coordinate.latitude) and math.isfinite(coordinate.longitude)):
+            raise ProviderUnavailableError("Nominatim returned an unexpected payload.")
+        return GeocodeHit(
+            coordinate=coordinate,
+            label=label,
+            country_code=country_code.lower() if isinstance(country_code, str) else None,
+        )
 
     def _wait_for_slot(self) -> None:
         """Space calls one interval apart, per process.

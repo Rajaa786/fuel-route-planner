@@ -29,6 +29,8 @@ class Route:
 class GeocodeHit:
     coordinate: Coordinate
     label: str
+    # ISO 3166-1 alpha-2, lower case, when the provider reports it.
+    country_code: str | None = None
 
 
 class ProviderError(Exception):
@@ -64,4 +66,8 @@ class RoutingProvider(Protocol):
 class Geocoder(Protocol):
     name: str
 
-    def geocode(self, query: str) -> GeocodeHit | None: ...
+    def geocode(self, query: str) -> GeocodeHit | None:
+        """Best match for free text, anywhere in the world."""
+
+    def geocode_address(self, street: str, city: str, state: str) -> GeocodeHit | None:
+        """A street address inside a known US city."""
