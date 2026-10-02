@@ -14,7 +14,7 @@ CAPACITY = 50.0
 MPG = 10.0
 
 
-def plan(positions, prices, distance, *, start_fuel=CAPACITY, stop_penalty=0.0):
+def plan(positions, prices, distance, *, start_fuel=CAPACITY, stop_penalty=0.0, detours=None):
     return plan_fuel_stops(
         positions,
         prices,
@@ -23,6 +23,7 @@ def plan(positions, prices, distance, *, start_fuel=CAPACITY, stop_penalty=0.0):
         miles_per_gallon=MPG,
         start_fuel_gallons=start_fuel,
         stop_penalty=stop_penalty,
+        detours=detours,
     )
 
 
@@ -30,17 +31,19 @@ def fuel_cost(purchases, prices):
     return sum(p.gallons * prices[p.index] for p in purchases)
 
 
-def assert_physically_valid(purchases, positions, distance, start_fuel=CAPACITY):
+def assert_physically_valid(purchases, positions, distance, start_fuel=CAPACITY, detours=None):
     """Replay the plan: never run dry, never overfill, every stop buys something."""
+    detours = detours or [0.0] * len(positions)
     fuel, here = start_fuel, 0.0
     for purchase in purchases:
-        fuel -= (positions[purchase.index] - here) / MPG
+        index = purchase.index
+        fuel -= (positions[index] + detours[index] - here) / MPG  # to the pump
         assert fuel >= -1e-6, "ran out of fuel before a stop"
         assert fuel == pytest.approx(purchase.fuel_on_arrival, abs=1e-6)
         assert purchase.gallons > 1e-9
         fuel += purchase.gallons
         assert fuel <= CAPACITY + 1e-6, "tank overfilled"
-        here = positions[purchase.index]
+        here = positions[index] - detours[index]  # back on the route, detour already "spent"
     assert fuel - (distance - here) / MPG >= -1e-6, "ran out of fuel before the destination"
 
 
@@ -79,41 +82,58 @@ def refund_greedy_cost(positions, prices, distance, start_fuel=CAPACITY):
     return spent
 
 
-def lp_cost(positions, prices, distance, start_fuel=CAPACITY):
-    """Zero-penalty optimum as a linear programme (second independent oracle)."""
+def lp_cost(positions, prices, distance, start_fuel=CAPACITY, detours=None):
+    """Zero-penalty optimum as a linear programme (independent of the DP).
+
+    Every listed station is visited, detour included, so with detours this is the
+    optimum *for that set of stops*; ``brute_force_objective`` minimises over sets.
+    """
     n = len(positions)
     if n == 0:
         return 0.0 if distance <= start_fuel * MPG + 1e-9 else None
+    detours = detours or [0.0] * n
+    # Miles driven on reaching each pump, and on reaching the destination.
+    driven, here = [], 0.0
+    total = 0.0
+    for position, detour in zip(positions, detours, strict=True):
+        total += position + detour - here
+        driven.append(total)
+        here = position - detour
+    total += distance - here
+    used_on_arrival = np.array(driven) / MPG
+
     rows, bounds = [], []
-    lower = np.tril(np.ones((n, n)))
-    used_on_arrival = np.array(positions) / MPG
     # Fuel on arrival at station i >= 0:  sum(buy[:i]) >= used_i - start
-    arrival = np.tril(np.ones((n, n)), k=-1)
-    rows.append(-arrival)
+    rows.append(-np.tril(np.ones((n, n)), k=-1))
     bounds.append(start_fuel - used_on_arrival)
     # Fuel after buying at i <= capacity:  sum(buy[:i+1]) <= capacity - start + used_i
-    rows.append(lower)
+    rows.append(np.tril(np.ones((n, n))))
     bounds.append(CAPACITY - start_fuel + used_on_arrival)
     # Fuel at destination >= 0.
     rows.append(-np.ones((1, n)))
-    bounds.append(np.array([start_fuel - distance / MPG]))
+    bounds.append(np.array([start_fuel - total / MPG]))
     result = linprog(prices, A_ub=np.vstack(rows), b_ub=np.concatenate(bounds), bounds=(0, None))
     return result.fun if result.status == 0 else None
 
 
-def brute_force_objective(positions, prices, distance, start_fuel, stop_penalty):
+def brute_force_objective(positions, prices, distance, start_fuel, stop_penalty, detours=None):
     """Exhaustive optimum of fuel cost + penalty * stops over every subset of stations."""
+    detours = detours or [0.0] * len(positions)
     best = None
     indices = range(len(positions))
     for size in range(len(positions) + 1):
         for subset in itertools.combinations(indices, size):
             cost = lp_cost(
-                [positions[i] for i in subset], [prices[i] for i in subset], distance, start_fuel
+                [positions[i] for i in subset],
+                [prices[i] for i in subset],
+                distance,
+                start_fuel,
+                [detours[i] for i in subset],
             )
             if cost is None:
                 continue
-            # Restricting to `subset` and paying for all of it is an upper bound that is
-            # tight for the optimal subset, so the minimum over subsets is exact.
+            # Visiting all of `subset` is an upper bound that is tight for the optimal
+            # set of stops, so the minimum over subsets is exact.
             value = cost + stop_penalty * size
             best = value if best is None else min(best, value)
     return best
@@ -242,3 +262,71 @@ def test_stop_penalty_matches_exhaustive_search():
         assert objective == pytest.approx(expected, abs=1e-5)
         checked += 1
     assert checked > 150
+
+
+# --- detours --------------------------------------------------------------------------------
+
+
+def test_detour_is_paid_for_out_and_back():
+    # One station 20 miles off the route at mile 400, on a 700-mile trip.
+    [purchase] = plan([400.0], [3.0], 700.0, detours=[20.0])
+    assert purchase.fuel_on_arrival == pytest.approx(50 - 42.0)  # 400 + 20 miles to the pump
+    # 20 miles back to the route + 300 to go = 32 gallons needed, 8 on board.
+    assert purchase.gallons == pytest.approx(24.0)
+    assert_physically_valid([purchase], [400.0], 700.0, detours=[20.0])
+
+
+def test_detour_can_make_an_otherwise_reachable_station_unreachable():
+    assert len(plan([490.0], [3.0], 600.0)) == 1
+    with pytest.raises(InfeasibleRouteError):
+        plan([490.0], [3.0], 600.0, detours=[15.0])  # 505 miles to the pump
+
+
+def test_near_station_beats_cheaper_far_one_when_the_detour_costs_more():
+    positions, prices, detours = [300.0, 310.0], [3.00, 2.95], [0.0, 24.0]
+    purchases = plan(positions, prices, 700.0, detours=detours)
+    # Saving 5 cents a gallon does not pay for 48 extra miles (4.8 gallons).
+    assert [p.index for p in purchases] == [0]
+
+
+def test_detours_match_exhaustive_search():
+    rng = random.Random(11)
+    checked = 0
+    for _ in range(400):
+        positions, prices, distance, start_fuel = random_instance(rng, max_stations=7)
+        detours = [rng.choice([0.0, 0.0, 3.0, 9.5, 24.0]) for _ in positions]
+        penalty = rng.choice([0.0, 0.0, 1.0, 2.0, 10.0])
+        expected = brute_force_objective(positions, prices, distance, start_fuel, penalty, detours)
+        try:
+            purchases = plan(
+                positions,
+                prices,
+                distance,
+                start_fuel=start_fuel,
+                stop_penalty=penalty,
+                detours=detours,
+            )
+        except InfeasibleRouteError:
+            assert expected is None
+            continue
+        assert_physically_valid(purchases, positions, distance, start_fuel, detours)
+        objective = fuel_cost(purchases, prices) + penalty * len(purchases)
+        assert objective == pytest.approx(expected, abs=1e-5)
+        checked += 1
+    assert checked > 150
+
+
+def test_rejects_negative_or_mismatched_detours():
+    with pytest.raises(ValueError):
+        plan([200.0], [3.0], 900.0, detours=[-1.0])
+    with pytest.raises(ValueError):
+        plan([200.0, 300.0], [3.0, 3.0], 900.0, detours=[1.0])
+
+
+@pytest.mark.parametrize("excess_miles", [1e-9, 5e-9, 1e-8, 1e-6, 0.004, 0.01])
+def test_trip_a_hair_beyond_the_starting_range_is_feasible(excess_miles):
+    """Regression: one tolerance used for both miles and gallons rejected such trips."""
+    distance = CAPACITY * MPG + excess_miles
+    purchases = plan([200.0], [3.0], distance)
+    if purchases:  # anything within tolerance of the range needs no stop at all
+        assert_physically_valid(purchases, [200.0], distance)

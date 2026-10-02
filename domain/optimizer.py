@@ -38,13 +38,23 @@ it fast:
 
 Complexity is ``O(n * w * log w)`` where ``w`` is the number of stations within
 one tank of range: about a millisecond for a coast-to-coast route.
+
+Detours
+-------
+A station may sit ``detour`` miles off the route. Visiting it costs that
+distance twice (out and back), so the leg between consecutive stops ``i -> j``
+is ``(position_j + detour_j) - (position_i - detour_i)``. The structure lemma
+only concerns consecutive stops and the tank, not the shape of the road, so the
+same DP applies with those leg lengths. With all detours zero it reduces to the
+plain mile-marker problem.
 """
 
 from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-# Tolerance (gallons / miles) for float comparisons; far below a cent of fuel.
+# Tolerance in gallons for float comparisons; far below a cent of fuel. Every
+# feasibility test is made in gallons so that one tolerance means one thing.
 _EPSILON = 1e-9
 
 
@@ -84,18 +94,24 @@ def plan_fuel_stops(
     miles_per_gallon: float,
     start_fuel_gallons: float,
     stop_penalty: float = 0.0,
+    detours: Sequence[float] | None = None,
 ) -> list[Purchase]:
     """Return the optimal purchases, in route order.
 
     ``positions`` must be strictly increasing mile markers within
-    ``[0, total_distance]``; ``prices`` are dollars per gallon. Raises
+    ``[0, total_distance]``; ``prices`` are dollars per gallon; ``detours`` are
+    one-way miles from the route to each station (default: none). Raises
     :class:`InfeasibleRouteError` if the destination cannot be reached.
     """
     count = len(positions)
-    if len(prices) != count:
-        raise ValueError("positions and prices must have the same length.")
+    if detours is None:
+        detours = [0.0] * count
+    if len(prices) != count or len(detours) != count:
+        raise ValueError("positions, prices and detours must have the same length.")
     if any(positions[i] >= positions[i + 1] for i in range(count - 1)):
         raise ValueError("positions must be strictly increasing.")
+    if any(detour < 0 for detour in detours):
+        raise ValueError("detours must not be negative.")
     if not 0 <= start_fuel_gallons <= tank_capacity_gallons:
         raise ValueError("start_fuel_gallons must be within the tank capacity.")
     if stop_penalty < 0:
@@ -105,11 +121,16 @@ def plan_fuel_stops(
 
     capacity = tank_capacity_gallons
     mpg = miles_per_gallon
-    full_range = capacity * mpg
-    start_range = start_fuel_gallons * mpg
 
-    if total_distance <= start_range + _EPSILON:
+    # Twice the tolerance on purpose: a purchase must exceed one tolerance to count as a
+    # stop, so a shortfall within float noise of that threshold must land on this side.
+    if total_distance / mpg <= start_fuel_gallons + 2 * _EPSILON:
         return []
+
+    # Where the vehicle is, in route miles, when it reaches a pump and when it is back on
+    # the route having left it. A leg from stop i to stop j burns arrive[j] - leave[i] miles.
+    arrive = [position + detour for position, detour in zip(positions, detours, strict=True)]
+    leave = [position - detour for position, detour in zip(positions, detours, strict=True)]
 
     # states[i]: (arrival_fuel, cost_so_far, back_pointer) for "we stop at i".
     # cost_so_far excludes the purchase (and penalty) at i itself.
@@ -118,9 +139,11 @@ def plan_fuel_stops(
         [] for _ in range(count)
     ]
     for j in range(count):
-        if positions[j] > start_range + _EPSILON:
-            break
-        states[j].append((start_fuel_gallons - positions[j] / mpg, 0.0, None))
+        if positions[j] / mpg > start_fuel_gallons + _EPSILON:
+            break  # markers only grow from here, and a detour never shortens a leg
+        needed = arrive[j] / mpg
+        if needed <= start_fuel_gallons + _EPSILON:
+            states[j].append((start_fuel_gallons - needed, 0.0, None))
 
     # Best known way to arrive at each station with an empty tank.
     arrive_empty: list[tuple[float, tuple[int, int, bool]] | None] = [None] * count
@@ -137,7 +160,6 @@ def plan_fuel_stops(
         states[i].sort(key=lambda state: state[0])
         fuels = [state[0] for state in states[i]]
         price = prices[i]
-        position = positions[i]
 
         # prefix[k] = min over states[:k + 1] of (cost - price * arrival_fuel), with its argmin.
         # Buying up to a level L from state s costs price * (L - fuel_s), so the best state
@@ -152,9 +174,12 @@ def plan_fuel_stops(
 
         leave_full = _cheapest_fill(fuels, prefix, price, capacity, stop_penalty)
 
-        j = i + 1
-        while j < count and positions[j] - position <= full_range + _EPSILON:
-            needed = (positions[j] - position) / mpg
+        for j in range(i + 1, count):
+            if (positions[j] - leave[i]) / mpg > capacity + _EPSILON:
+                break  # beyond a full tank even without j's own detour
+            needed = (arrive[j] - leave[i]) / mpg
+            if needed > capacity + _EPSILON:
+                continue
             if prices[j] > price:
                 if leave_full is not None:
                     states[j].append((capacity - needed, leave_full[0], (i, leave_full[1], True)))
@@ -164,28 +189,29 @@ def plan_fuel_stops(
                     arrive_empty[j] is None or option[0] < arrive_empty[j][0]
                 ):
                     arrive_empty[j] = (option[0], (i, option[1], False))
-            j += 1
 
-        if total_distance - position <= full_range + _EPSILON:
-            final_leg = (total_distance - position) / mpg
+        final_leg = (total_distance - leave[i]) / mpg
+        if final_leg <= capacity + _EPSILON:
             option = _cheapest_fill(fuels, prefix, price, final_leg, stop_penalty)
             if option is not None and option[0] < best_total:
                 best_total, best_final = option[0], (i, option[1])
 
     if best_final is None:
-        raise _diagnose_gap(positions, total_distance, start_range, full_range)
+        raise _diagnose_gap(
+            positions, arrive, leave, total_distance, start_fuel_gallons, capacity, mpg
+        )
 
     # Walk the back-pointers from the last stop to the origin.
     purchases: list[Purchase] = []
     station, state_index = best_final
-    next_position, left_full = total_distance, False
+    next_arrival, left_full = total_distance, False
     while True:
         fuel, _, back = states[station][state_index]
-        target = capacity if left_full else (next_position - positions[station]) / mpg
+        target = capacity if left_full else (next_arrival - leave[station]) / mpg
         purchases.append(Purchase(index=station, gallons=target - fuel, fuel_on_arrival=fuel))
         if back is None:
             break
-        next_position = positions[station]
+        next_arrival = arrive[station]
         station, state_index, left_full = back
     purchases.reverse()
     return purchases
@@ -210,13 +236,27 @@ def _cheapest_fill(
 
 
 def _diagnose_gap(
-    positions: Sequence[float], total_distance: float, start_range: float, full_range: float
+    positions: Sequence[float],
+    arrive: Sequence[float],
+    leave: Sequence[float],
+    total_distance: float,
+    start_fuel: float,
+    capacity: float,
+    mpg: float,
 ) -> InfeasibleRouteError:
-    """Locate the first stretch that cannot be bridged, for a useful error message."""
-    previous, reach = 0.0, start_range
-    for position in [*positions, total_distance]:
-        if position - previous > reach + _EPSILON:
-            return InfeasibleRouteError(previous, position, reach)
-        previous, reach = position, full_range
-    # Unreachable in practice: the DP only fails when such a gap exists.
-    return InfeasibleRouteError(0.0, total_distance, start_range)
+    """Locate the stretch that cannot be bridged, for a useful error message.
+
+    Finds the furthest station that can be reached at all; the gap runs from
+    there to the next point on the route (a station or the destination).
+    """
+    reachable = [False] * len(positions)
+    for j in range(len(positions)):
+        reachable[j] = arrive[j] / mpg <= start_fuel + _EPSILON or any(
+            reachable[i] and (arrive[j] - leave[i]) / mpg <= capacity + _EPSILON for i in range(j)
+        )
+    frontier = max((j for j, ok in enumerate(reachable) if ok), default=None)
+    gap_start = 0.0 if frontier is None else positions[frontier]
+    reach = (start_fuel if frontier is None else capacity) * mpg
+    following = (frontier + 1) if frontier is not None else 0
+    gap_end = positions[following] if following < len(positions) else total_distance
+    return InfeasibleRouteError(gap_start, gap_end, reach)
