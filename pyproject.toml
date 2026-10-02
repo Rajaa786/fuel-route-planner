@@ -1,0 +1,45 @@
+[project]
+name = "fuel-route-planner"
+version = "1.0.0"
+description = "Django API that plans cost-optimal fuel stops along a driving route within the USA."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "django>=6.1,<6.2",
+    "djangorestframework>=3.18,<3.19",
+    "drf-spectacular>=0.30,<0.31",
+    "django-environ>=0.14,<0.15",
+    "httpx>=0.28,<0.29",
+    "numpy>=2.5,<3",
+    "scipy>=1.18,<2",
+    "gunicorn>=26.2,<27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1,<10",
+    "pytest-django>=4.14,<5",
+    "ruff>=0.16,<0.17",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings_test"
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "DJ", "SIM", "C4", "PERF", "RUF"]
+# RUF012 flags the idiomatic mutable class attributes of Django Meta/DRF classes.
+ignore = ["RUF012"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["apps", "config", "domain", "providers"]
