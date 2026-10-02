@@ -149,6 +149,22 @@ def test_import_command_refuses_to_empty_the_table(gazetteer, tmp_path):
     assert FuelStation.objects.count() == 1
 
 
+def test_bootstrap_forwards_verbosity_so_skipped_stations_can_be_listed(
+    gazetteer, tmp_path, settings
+):
+    path = tmp_path / "fuel.csv"
+    body = "7,WOODSHED,I-44,Big Cabin,OK,307,3.10\n8,LOVES,I-20,Greenwood,LA,1,2.50\n"
+    path.write_text(CSV_HEADER + body, encoding="utf-8")
+    settings.FUEL_PRICES_PATH = path
+
+    quiet, verbose = StringIO(), StringIO()
+    call_command("bootstrap_data", stdout=quiet)
+    call_command("bootstrap_data", stdout=verbose, verbosity=2)
+
+    assert "8: Greenwood, LA" not in quiet.getvalue()
+    assert "8: Greenwood, LA" in verbose.getvalue()
+
+
 def test_shipped_gazetteer_loads_and_resolves_known_cities(db, settings):
     call_command("load_places", stdout=StringIO())
     assert Place.objects.count() > 150_000

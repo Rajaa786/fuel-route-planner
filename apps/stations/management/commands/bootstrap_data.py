@@ -12,9 +12,9 @@ class Command(BaseCommand):
             "--force", action="store_true", help="Reload the gazetteer even if already loaded."
         )
 
-    def handle(self, *args, force: bool, **options):
+    def handle(self, *args, force: bool, verbosity: int, **options):
         if force or not Place.objects.exists():
-            call_command("load_places", stdout=self.stdout)
+            call_command("load_places", stdout=self.stdout, verbosity=verbosity)
         else:
             self.stdout.write("Gazetteer already loaded (use --force to reload).")
-        call_command("import_fuel_stations", stdout=self.stdout)
+        call_command("import_fuel_stations", stdout=self.stdout, verbosity=verbosity)

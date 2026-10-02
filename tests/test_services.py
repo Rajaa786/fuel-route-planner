@@ -11,8 +11,15 @@ from apps.planner.services import (
     NoFeasibleFuelPlanError,
     SameLocationError,
 )
+from apps.stations.models import Place
 from providers.base import ProviderUnavailableError, Route
-from tests.helpers import ROAD_LATITUDE, FakeRoutingProvider, longitude_at_mile, make_station
+from tests.helpers import (
+    ROAD_LATITUDE,
+    FakeGeocoder,
+    FakeRoutingProvider,
+    longitude_at_mile,
+    make_station,
+)
 
 
 def at(mile: float) -> str:
@@ -112,6 +119,20 @@ def test_stop_penalty_trades_a_little_fuel_cost_for_fewer_stops(make_planner, ro
     assert cheapest.cheapest_possible_purchase_cost == cheapest.fuel_purchased_cost
 
 
+def replay_with_detours(plan, tank=50.0, mpg=10.0):
+    """Drive the plan, detours included, and return the lowest fuel level seen."""
+    fuel, here, lowest = tank, 0.0, tank
+    for stop in plan.stops:
+        where = stop.location
+        fuel -= (where.mile_marker - here + where.off_route_miles) / mpg  # reach the pump
+        lowest = min(lowest, fuel)
+        fuel += float(stop.gallons)
+        assert fuel <= tank + 0.02, "tank overfilled"
+        fuel -= where.off_route_miles / mpg  # back to the route
+        here = where.mile_marker
+    return min(lowest, fuel - (plan.distance_miles - here) / mpg)
+
+
 def test_corridor_widens_only_when_the_narrow_one_is_infeasible(make_planner, routing):
     make_station(1, 400, "3.000", miles_north=8)  # outside 5 mi, inside 10 mi
     plan = make_planner(routing).plan(at(0), at(800))
@@ -120,6 +141,123 @@ def test_corridor_widens_only_when_the_narrow_one_is_infeasible(make_planner, ro
     assert [stop.location.station.opis_id for stop in plan.stops] == [1]
     assert plan.stops[0].location.off_route_miles == pytest.approx(8, abs=0.3)
     assert len(plan.warnings) == 1 and "10 miles" in plan.warnings[0]
+
+    # The 16-mile round trip to the pump is driven, bought and reported.
+    assert plan.detour_miles == pytest.approx(16, abs=0.6)
+    assert plan.trip_fuel_gallons == pytest.approx(Decimal("81.60"), abs=Decimal("0.07"))
+    assert plan.starting_fuel_gallons_used + plan.gallons_purchased == plan.trip_fuel_gallons
+    assert "16 miles" in plan.warnings[0]
+    assert replay_with_detours(plan) >= 2.5 - 0.02  # never dips into the reserve
+
+
+def test_far_off_route_stations_never_yield_a_plan_that_runs_dry(make_planner, routing):
+    """Regression: detours in a widened corridor were not charged, so the tank went negative."""
+    make_station(1, 420, "3.000", miles_north=24)
+    make_station(2, 840, "3.100", miles_north=24)
+    plan = make_planner(routing).plan(at(0), at(1240))
+
+    assert plan.corridor_miles == 25.0 and len(plan.stops) == 2
+    assert plan.detour_miles == pytest.approx(96, abs=1.5)
+    assert replay_with_detours(plan) >= 2.5 - 0.02
+
+    # The same layout stretched so that a leg plus its detours exceeds the range is refused.
+    make_station(3, 1300, "3.000", miles_north=24)
+    with pytest.raises(NoFeasibleFuelPlanError):
+        make_planner(routing).plan(at(0), at(1750))
+
+
+def test_infeasible_message_stays_true_when_detours_are_the_cause(make_planner, routing):
+    # The gap between the two stations is only 440 miles, but each is 24 miles off the route.
+    make_station(1, 440, "3.000", miles_north=24)
+    make_station(2, 880, "3.000", miles_north=24)
+    with pytest.raises(NoFeasibleFuelPlanError) as excinfo:
+        make_planner(routing).plan(at(0), at(1300))
+
+    error = excinfo.value
+    assert error.gap_end_miles - error.gap_start_miles < error.reachable_miles
+    assert "counting the drive to stations off the route" in str(error)
+    assert "longer than" not in str(error)  # the old wording would be false here
+
+
+def test_widened_corridor_keeps_the_reachable_station_of_a_town(make_planner, routing):
+    """Regression: only the cheapest station per town was kept, even when out of reach."""
+    make_station(1, 460, "2.500", miles_north=24, city="Sametown")  # cheap, 484 mi to reach
+    make_station(2, 460, "3.500", miles_north=12, city="Sametown")  # dear, 472 mi to reach
+    plan = make_planner(routing).plan(at(0), at(800))
+
+    # Only the dear station can be reached from the start. Once there, the cheap one across
+    # town is in range, so the plan tops up just enough to get to it and fills up there.
+    assert [stop.location.station.opis_id for stop in plan.stops] == [2, 1]
+    assert plan.stops[0].gallons < 5 < plan.stops[1].gallons
+    # Both are in the same town: their mile markers differ only by the tie-breaking nudge.
+    first, second = (stop.location.mile_marker for stop in plan.stops)
+    assert 0 < second - first < 1e-3
+    assert replay_with_detours(plan) >= 2.5 - 0.02
+
+
+def test_widened_corridor_still_prefers_the_cheaper_station_when_it_is_reachable(
+    make_planner, routing
+):
+    make_station(1, 400, "2.500", miles_north=20, city="Sametown")
+    make_station(2, 400, "3.500", miles_north=12, city="Sametown")  # both need the 25-mile tier
+    plan = make_planner(routing).plan(at(0), at(800))
+
+    assert plan.corridor_miles == 25.0 and plan.candidate_stations == 2
+    assert [stop.location.station.opis_id for stop in plan.stops] == [1]
+    assert plan.cheapest_possible_purchase_cost == plan.fuel_purchased_cost
+    assert replay_with_detours(plan) >= 2.5 - 0.02
+
+
+def test_equally_priced_stations_in_a_town_resolve_to_the_nearer_one(make_planner, routing):
+    # Three pumps in one town. Two are kept: the nearest (station 3) and the cheapest, and
+    # of the two equally cheap ones that must be the nearer (station 2), not the first listed.
+    make_station(1, 400, "3.000", miles_north=24, city="Sametown")
+    make_station(2, 400, "3.000", miles_north=12, city="Sametown")
+    make_station(3, 400, "3.400", miles_north=11, city="Sametown")
+    plan = make_planner(routing).plan(at(0), at(800))
+
+    assert plan.candidate_stations == 2
+    assert [stop.location.station.opis_id for stop in plan.stops] == [2]
+
+
+def test_strictly_cheapest_figure_also_pays_for_detours(make_planner, routing):
+    make_station(1, 300, "2.990", miles_north=8)
+    make_station(2, 320, "3.000", miles_north=8)
+    make_station(3, 600, "3.500", miles_north=8)
+    planner = make_planner(routing)
+
+    practical = planner.plan(at(0), at(900), stop_penalty=2.0)
+    cheapest = planner.plan(at(0), at(900), stop_penalty=0.0)
+
+    assert practical.corridor_miles == cheapest.corridor_miles == 10.0
+    assert practical.cheapest_possible_purchase_cost == cheapest.fuel_purchased_cost
+    assert cheapest.fuel_purchased_cost <= practical.fuel_purchased_cost
+
+
+def test_a_less_precise_location_is_reported_as_a_warning(make_planner, routing):
+    make_station(1, 400, "3.000")
+    Place.objects.create(
+        key="EASTVILLE",
+        state="OH",
+        name="Eastville",
+        latitude=ROAD_LATITUDE,
+        longitude=longitude_at_mile(800),
+        population=10,
+    )
+    plan = make_planner(routing, fallback=FakeGeocoder()).plan(at(0), "12 Main St, Eastville, OH")
+
+    assert plan.finish.label == "Eastville, OH"
+    assert plan.warnings == (
+        "'12 Main St' was not found in Eastville, OH; the city centre is used instead.",
+    )
+
+
+def test_detours_are_not_charged_inside_the_default_corridor(make_planner, routing):
+    make_station(1, 400, "3.000", miles_north=4)
+    plan = make_planner(routing).plan(at(0), at(800))
+
+    assert plan.corridor_miles == 5.0 and plan.detour_miles == 0.0
+    assert plan.trip_fuel_gallons == Decimal("80.00")
 
 
 def test_narrow_corridor_is_kept_when_it_works(make_planner, routing):
@@ -177,9 +315,44 @@ def test_routing_failures_are_not_cached(make_planner):
 
 def test_same_start_and_finish_is_rejected_before_routing(make_planner, routing):
     make_station(1, 400, "3.000")
-    with pytest.raises(SameLocationError):
-        make_planner(routing).plan(at(10), at(10))
+    almost = f"{ROAD_LATITUDE},{longitude_at_mile(10) + 1e-7:.7f}"  # differs in the 7th decimal
+    for finish in (at(10), almost):
+        with pytest.raises(SameLocationError):
+            make_planner(routing).plan(at(10), finish)
     assert routing.calls == 0
+
+
+def test_points_that_snap_to_one_spot_are_the_same_location(make_planner):
+    class ZeroLengthProvider(FakeRoutingProvider):
+        def route(self, start, finish):
+            route = super().route(start, finish)
+            return Route(0.0, 0.0, route.encoded_polyline)
+
+    make_station(1, 400, "3.000")
+    with pytest.raises(SameLocationError):
+        make_planner(ZeroLengthProvider()).plan(at(10), at(10.05))
+
+
+def test_trips_a_block_apart_do_not_share_a_cached_route(make_planner, routing):
+    make_station(1, 400, "3.000")
+    planner = make_planner(routing)
+    here, block_away = at(0), f"{ROAD_LATITUDE},{longitude_at_mile(0) + 0.002:.6f}"  # ~170 m
+
+    first = planner.plan(here, at(800))
+    second = planner.plan(block_away, at(800))
+
+    assert routing.calls == 2
+    assert first.distance_miles != second.distance_miles
+
+
+def test_infeasible_message_describes_the_gap_only(make_planner, routing):
+    make_station(1, 100, "3.000")
+    with pytest.raises(NoFeasibleFuelPlanError) as excinfo:
+        make_planner(routing).plan(at(0), at(1300))
+    message = str(excinfo.value)
+    assert "between mile 100.0 and mile 1300.0" in message
+    assert "no fuel station within 25 miles" in message
+    assert "United States" not in message
 
 
 def test_missing_fuel_data_is_a_distinct_failure(make_planner, routing):

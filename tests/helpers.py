@@ -71,18 +71,29 @@ class FakeRoutingProvider:
 
 
 class FakeGeocoder:
+    """Canned geocoder. ``hits`` answers free text, ``address_hits`` structured lookups."""
+
     name = "fake-geocoder"
 
-    def __init__(self, hits: dict | None = None, error: Exception | None = None):
+    def __init__(self, hits=None, address_hits=None, error: Exception | None = None):
         self.hits = hits or {}
+        self.address_hits = address_hits or {}
         self.error = error
         self.calls = 0
+        self.address_queries: list[tuple[str, str, str]] = []
 
     def geocode(self, query: str):
         self.calls += 1
         if self.error is not None:
             raise self.error
         return self.hits.get(query)
+
+    def geocode_address(self, street: str, city: str, state: str):
+        self.calls += 1
+        self.address_queries.append((street, city, state))
+        if self.error is not None:
+            raise self.error
+        return self.address_hits.get((street, city, state))
 
 
 def make_station(opis_id: int, mile: float, price: str, *, miles_north: float = 0.0, **extra):

@@ -33,6 +33,7 @@ def present_plan(plan: RoutePlan, *, map_url: str, elapsed_ms: float) -> dict:
             "fuel_purchased_cost": float(plan.fuel_purchased_cost),
             "starting_fuel_cost_estimate": float(plan.starting_fuel_cost_estimate),
             "trip_fuel_gallons": float(plan.trip_fuel_gallons),
+            "detour_miles": round(plan.detour_miles, 1),
             "gallons_purchased": float(plan.gallons_purchased),
             "starting_fuel_gallons_used": float(plan.starting_fuel_gallons_used),
             "reference_price_per_gallon": float(plan.reference_price),
@@ -110,7 +111,12 @@ def _notes(plan: RoutePlan) -> list[str]:
         "total_fuel_cost prices every gallon the trip burns: fuel bought at the stops plus "
         "fuel burned from the starting tank valued at reference_price_per_gallon.",
         "Stations are located by city; latitude/longitude of a stop is the point on the route "
-        "nearest to that city. Detour mileage is not included.",
+        "nearest to that city.",
+        (
+            "The corridor had to be widened, so detours to the stops are driven and paid for."
+            if plan.detour_miles
+            else "Stations lie within a few miles of the route; detour mileage is not counted."
+        ),
     ]
     if not plan.stops:
         notes.append("The trip is within range of the starting tank, so no stop is required.")

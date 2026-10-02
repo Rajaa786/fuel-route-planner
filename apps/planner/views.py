@@ -7,14 +7,15 @@ from django.urls import reverse
 from django.utils.csp import CSP
 from django.views.decorators.csp import csp_override
 from django.views.decorators.http import require_GET
-from drf_spectacular.utils import OpenApiExample, extend_schema
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, extend_schema
 from rest_framework import status
-from rest_framework.renderers import JSONRenderer
+from rest_framework.negotiation import DefaultContentNegotiation
+from rest_framework.renderers import JSONRenderer, StaticHTMLRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.planner.errors import envelope, problem_for
+from apps.planner.errors import INVALID_REQUEST_MESSAGE, envelope, problem_for
 from apps.planner.presenters import present_plan
 from apps.planner.serializers import (
     ErrorSerializer,
@@ -37,8 +38,47 @@ MAP_PAGE_CSP = {
 }
 
 
+def _examples(parameter: str, values: dict[str, str]) -> list[OpenApiExample]:
+    return [
+        OpenApiExample(name, value=value, parameter_only=(parameter, OpenApiParameter.QUERY))
+        for name, value in values.items()
+    ]
+
+
+LOCATION_EXAMPLES = [
+    *_examples(
+        "start",
+        {
+            "City and state": "Chicago, IL",
+            "City only": "Chicago",
+            "Full state name": "Chicago, Illinois",
+            "Coordinates": "41.8781,-87.6298",
+            "Street address": "233 S Wacker Dr, Chicago, IL",
+        },
+    ),
+    *_examples(
+        "finish",
+        {"City and state": "Dallas, TX", "City only": "Dallas", "Coordinates": "32.7767,-96.7970"},
+    ),
+]
+
+
+class IgnoreFormatParameter(DefaultContentNegotiation):
+    """These endpoints have one representation each, so ``?format=`` selects nothing.
+
+    DRF's default answers an unknown format with a bare 404; ignoring the
+    parameter is kinder. Scoped to these views so that the schema endpoint
+    keeps its documented ``?format=json``.
+    """
+
+    def filter_renderers(self, renderers, format):
+        return renderers
+
+
 class RoutePlanView(APIView):
     """Plan a route between two US locations and the cheapest places to refuel."""
+
+    content_negotiation_class = IgnoreFormatParameter
 
     @extend_schema(
         operation_id="plan_route",
@@ -54,18 +94,19 @@ class RoutePlanView(APIView):
             504: ErrorSerializer,
         },
         examples=[
+            *LOCATION_EXAMPLES,
             OpenApiExample(
                 "Unknown location",
                 value={
                     "error": {
                         "code": "location_not_found",
                         "message": "Could not find a US location matching 'Atlantis'.",
-                        "details": {},
+                        "details": {"query": "Atlantis", "accepted_formats": ["City, ST", "..."]},
                     }
                 },
                 response_only=True,
                 status_codes=["422"],
-            )
+            ),
         ],
     )
     def get(self, request: Request) -> Response:
@@ -92,14 +133,16 @@ class RouteMapView(APIView):
     """
 
     # Only used for errors raised before the handler runs (throttling); the page
-    # itself is returned as a ready-made HttpResponse.
-    renderer_classes = [JSONRenderer]
+    # itself is returned as a ready-made HttpResponse. The HTML renderer is listed so a
+    # client that accepts nothing but text/html is not turned away with a 406.
+    renderer_classes = [JSONRenderer, StaticHTMLRenderer]
+    content_negotiation_class = IgnoreFormatParameter
 
     @extend_schema(exclude=True)
     def get(self, request: Request) -> HttpResponse:
         query = RoutePlanQuerySerializer(data=request.query_params)
         if not query.is_valid():
-            return self._error(request, status.HTTP_400_BAD_REQUEST, "Invalid request parameters.")
+            return self._error(request, status.HTTP_400_BAD_REQUEST, INVALID_REQUEST_MESSAGE)
 
         try:
             plan = get_route_planner().plan(**query.validated_data)

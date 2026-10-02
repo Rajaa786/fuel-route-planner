@@ -100,6 +100,9 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 # OpenStreetMap's tile servers reject requests that carry no Referer.
 SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 X_FRAME_OPTIONS = "DENY"
+# Load balancers probe over plain HTTP and treat a redirect as a failure, so the health
+# check is never redirected to HTTPS (only relevant when SECURE_SSL_REDIRECT is on).
+SECURE_REDIRECT_EXEMPT = [r"^health/$"]
 if env.bool("DJANGO_BEHIND_TLS_PROXY", default=False):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SECURE_SSL_REDIRECT = True
@@ -140,6 +143,9 @@ SPECTACULAR_SETTINGS = {
     ),
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
+    # Pinned: the default is "@latest", i.e. whatever the CDN serves that day.
+    "SWAGGER_UI_DIST": "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.33.1",
+    "SWAGGER_UI_FAVICON_HREF": "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.33.1/favicon-32x32.png",
 }
 
 # --- Application ----------------------------------------------------------------------------

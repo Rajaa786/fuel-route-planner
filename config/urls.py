@@ -1,5 +1,6 @@
 from django.urls import include, path
 from django.views.decorators.csp import csp_override
+from django.views.generic import RedirectView
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 from apps.planner.views import health
@@ -9,6 +10,7 @@ from apps.planner.views import health
 swagger_ui = csp_override({})(SpectacularSwaggerView.as_view(url_name="schema"))
 
 urlpatterns = [
+    path("", RedirectView.as_view(pattern_name="docs"), name="root"),
     path("api/v1/", include("apps.planner.urls")),
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
     path("api/docs/", swagger_ui, name="docs"),

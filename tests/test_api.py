@@ -9,7 +9,10 @@ from apps.planner.serializers import RoutePlanResponseSerializer
 from apps.planner.throttling import ClientRateThrottle
 from apps.stations.models import Place
 from providers.base import (
+    Coordinate,
+    GeocodeHit,
     NoRouteFoundError,
+    ProviderError,
     ProviderRateLimitedError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -17,6 +20,7 @@ from providers.base import (
 )
 from tests.helpers import (
     ROAD_LATITUDE,
+    FakeGeocoder,
     FakeRoutingProvider,
     longitude_at_mile,
     make_station,
@@ -243,10 +247,94 @@ def test_throttle_counters_do_not_share_the_route_cache(client, world):
     assert any("throttle" in str(key) for key in caches["throttle"]._cache)
 
 
-def test_only_get_is_allowed(client, world):
-    response = client.post(URL, {"start": "Westville, NE", "finish": "Eastville, OH"})
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+def test_only_get_is_allowed(client, world, method):
+    response = getattr(client, method)(URL, TRIP)
     assert response.status_code == 405
     assert response.json()["error"]["code"] == "method_not_allowed"
+    assert world.calls == 0
+
+
+def test_errors_tell_the_caller_what_to_send_instead(client, world):
+    missing = client.get(URL, {"start": "Westville, NE"}).json()["error"]
+    assert "?start=Chicago, IL&finish=Dallas, TX" in missing["message"]
+    assert list(missing["details"]) == ["finish"]
+
+    # The same message must not misdescribe a different mistake.
+    negative = client.get(URL, {**TRIP, "stop_penalty": "-1"}).json()["error"]
+    assert "required" not in negative["message"] and list(negative["details"]) == ["stop_penalty"]
+
+    unknown = client.get(URL, {"start": "Nowhere, NE", "finish": "Eastville, OH"}).json()["error"]
+    assert unknown["details"]["query"] == "Nowhere, NE"
+    assert any("Chicago, IL" in example for example in unknown["details"]["accepted_formats"])
+
+    same = client.get(URL, {"start": "Westville, NE", "finish": "westville ne"}).json()["error"]
+    assert "Westville, NE" in same["message"]  # says what both sides resolved to
+
+
+def test_ambiguous_city_returns_the_candidates_without_any_external_call(client, world):
+    Place.objects.bulk_create(
+        [
+            Place(key="PEORIA", state="AZ", name="Peoria", latitude=33.58, longitude=-112.24,
+                  population=190_000),
+            Place(key="PEORIA", state="IL", name="Peoria", latitude=40.69, longitude=-89.59,
+                  population=115_000),
+        ]
+    )  # fmt: skip
+    response = client.get(URL, {"start": "Peoria", "finish": "Eastville, OH"})
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "location_ambiguous"
+    assert error["details"] == {"query": "Peoria", "candidates": ["Peoria, AZ", "Peoria, IL"]}
+    assert world.calls == 0
+
+
+def test_format_query_parameter_is_ignored(client, world):
+    response = client.get(URL, {**TRIP, "format": "xml"})
+    assert response.status_code == 200 and response["Content-Type"] == "application/json"
+    assert client.get(MAP_URL, {**TRIP, "format": "xml"}).status_code == 200
+    # ...but only on the plan endpoints: the schema keeps its documented ?format=json.
+    schema = client.get("/api/schema/", {"format": "json"})
+    assert schema.status_code == 200 and "json" in schema["Content-Type"]
+
+
+def test_foreign_match_reports_what_was_understood(client, world, make_planner, monkeypatch):
+    hit = GeocodeHit(Coordinate(43.65, -79.38), "Napoli, Campania, Italia", "it")
+    planner = make_planner(world, fallback=FakeGeocoder({"Naples": hit}))
+    monkeypatch.setattr(views, "get_route_planner", lambda: planner)
+
+    response = client.get(URL, {"start": "Naples", "finish": "Eastville, OH"})
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "location_outside_service_area"
+    assert error["details"] == {"query": "Naples", "matched": "Napoli, Campania, Italia"}
+    assert "add its state" in error["message"]
+
+
+def test_any_provider_error_is_a_502_never_a_500(client, world):
+    world.error = ProviderError("a kind of failure added later")
+    response = client.get(URL, TRIP)
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_unavailable"
+
+
+def test_unexpected_failure_is_a_json_500(world, monkeypatch):
+    def broken():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(views, "get_route_planner", broken)
+    response = APIClient(raise_request_exception=False).get(URL, TRIP)
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "An unexpected error occurred.",
+            "details": {},
+        }
+    }
 
 
 def test_missing_fuel_data_returns_503(client, db, make_planner, monkeypatch):
@@ -294,9 +382,19 @@ def test_map_page_escapes_untrusted_text_and_sets_a_nonce_policy(client, world):
     assert html.count(f'nonce="{nonce}"') == 3  # style, leaflet, inline script
 
 
+def test_map_page_is_served_to_a_client_that_only_accepts_html(client, world):
+    response = client.get(MAP_URL, TRIP, HTTP_ACCEPT="text/html")
+    assert response.status_code == 200
+    assert response["Content-Type"].startswith("text/html")
+
+
 def test_map_page_shows_errors_as_html(client, world):
     bad_input = client.get(MAP_URL, {"start": "Westville, NE"})
     unknown = client.get(MAP_URL, {"start": "Nowhere, NE", "finish": "Eastville, OH"})
+    state = client.get(MAP_URL, {"start": "Wyoming", "finish": "Eastville, OH"})
+
+    assert state.status_code == 422 and b"is a state" in state.content
+    assert b"?start=Chicago, IL&amp;finish=Dallas, TX" in bad_input.content  # how to fix it
 
     assert bad_input.status_code == 400 and b"Invalid request parameters" in bad_input.content
     assert unknown.status_code == 422 and b"Could not find a US location" in unknown.content
@@ -313,6 +411,24 @@ def test_health_reflects_whether_fuel_data_is_loaded(client, db):
     assert response.json() == {"status": "ok", "fuel_stations": 1}
 
 
+def test_site_root_leads_to_the_api_docs(client, db):
+    response = client.get("/")
+    assert response.status_code == 302 and response["Location"] == "/api/docs/"
+
+
+def test_health_check_is_not_redirected_to_https(client, db, settings):
+    settings.SECURE_SSL_REDIRECT = True
+    make_station(1, 100, "3.000")
+
+    assert client.get("/health/").status_code == 200  # a redirect fails a load balancer probe
+    assert client.get(URL, TRIP).status_code == 301
+
+
+def test_swagger_ui_assets_are_pinned(client, db):
+    html = client.get("/api/docs/").content.decode()
+    assert "swagger-ui-dist@5.33.1" in html and "@latest" not in html
+
+
 def test_unknown_url_returns_the_json_error_envelope(client, db):
     response = client.get("/api/v1/nope/")
     assert response.status_code == 404
@@ -323,5 +439,12 @@ def test_openapi_schema_documents_the_endpoint(client, db):
     response = client.get("/api/schema/", HTTP_ACCEPT="application/json")
     assert response.status_code == 200
     operation = response.json()["paths"]["/api/v1/route-plan/"]["get"]
-    assert {p["name"] for p in operation["parameters"]} == {"start", "finish", "stop_penalty"}
+    parameters = {p["name"]: p for p in operation["parameters"]}
+    assert set(parameters) == {"start", "finish", "stop_penalty"}
+    # The documented limits are the ones the serializer enforces...
+    assert parameters["start"]["required"] and parameters["start"]["schema"]["maxLength"] == 200
+    assert parameters["stop_penalty"]["schema"]["minimum"] == 0
+    assert parameters["stop_penalty"]["schema"]["maximum"] == 1000
+    # ...and each location parameter comes with examples to try.
+    assert len(parameters["start"]["examples"]) == 5 and len(parameters["finish"]["examples"]) == 3
     assert client.get("/api/docs/").status_code == 200

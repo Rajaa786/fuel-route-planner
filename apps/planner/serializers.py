@@ -7,22 +7,24 @@ two never drift apart.
 
 from rest_framework import serializers
 
+LOCATION_HELP = (
+    "A US location. The state and the comma are optional for large cities: "
+    "`Chicago, IL`, `Chicago IL`, `Chicago, Illinois` and `Chicago` all work, as does "
+    "`41.8781,-87.6298`. Street addresses, ZIP codes, landmarks and small towns given "
+    "without a state also work, at the cost of one geocoding call."
+)
+
 
 class RoutePlanQuerySerializer(serializers.Serializer):
-    start = serializers.CharField(
-        max_length=200,
-        help_text='Start location: "City, ST", a "lat,lon" pair, or a US street address.',
-    )
-    finish = serializers.CharField(
-        max_length=200, help_text="Finish location, in the same formats as `start`."
-    )
+    start = serializers.CharField(max_length=200, help_text="Start. " + LOCATION_HELP)
+    finish = serializers.CharField(max_length=200, help_text="Finish. " + LOCATION_HELP)
     stop_penalty = serializers.FloatField(
         required=False,
         min_value=0,
         max_value=1000,
         help_text=(
-            "Dollar value placed on avoiding one fuel stop. 0 returns the strictly cheapest "
-            "plan; the server default drops stops that would save less than that amount."
+            "Dollars a fuel stop must save to be worth making. 0 returns the strictly "
+            "cheapest plan; the server default is 2."
         ),
     )
 
@@ -82,7 +84,15 @@ class SummarySerializer(serializers.Serializer):
     starting_fuel_cost_estimate = serializers.FloatField(
         help_text="starting_fuel_gallons_used x reference_price_per_gallon."
     )
-    trip_fuel_gallons = serializers.FloatField(help_text="Fuel burned: distance / mpg.")
+    trip_fuel_gallons = serializers.FloatField(
+        help_text="Fuel burned: (route distance + detour_miles) / mpg."
+    )
+    detour_miles = serializers.FloatField(
+        help_text=(
+            "Miles driven off the route to reach the stops. 0 unless the search corridor "
+            "had to be widened (see warnings)."
+        )
+    )
     gallons_purchased = serializers.FloatField()
     starting_fuel_gallons_used = serializers.FloatField()
     reference_price_per_gallon = serializers.FloatField()

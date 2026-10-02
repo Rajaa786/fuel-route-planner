@@ -29,6 +29,7 @@ from apps.stations.index import RouteMatches, StationIndex, StationRecord
 from domain import geometry
 from domain.optimizer import InfeasibleRouteError, Purchase, plan_fuel_stops
 from providers.base import (
+    Coordinate,
     NoRouteFoundError,
     ProviderUnavailableError,
     Route,
@@ -40,6 +41,10 @@ logger = logging.getLogger(__name__)
 _CENT = Decimal("0.01")
 _HUNDREDTH = Decimal("0.01")
 _MILL = Decimal("0.001")
+# Shorter than this is not a trip (about 50 feet).
+_MIN_TRIP_MILES = 0.01
+# Separates two stations kept at the same mile marker (about a sixteenth of an inch).
+_MARKER_NUDGE_MILES = 1e-6
 
 REFERENCE_AVERAGE_PAID = "average_price_paid_at_stops"
 REFERENCE_CHEAPEST_ON_ROUTE = "cheapest_station_on_route"
@@ -48,6 +53,10 @@ REFERENCE_DATASET_AVERAGE = "dataset_average_price"
 
 class SameLocationError(Exception):
     """Start and finish resolve to the same point."""
+
+    def __init__(self, label: str):
+        self.label = label
+        super().__init__(f"Start and finish resolve to the same location ({label}).")
 
 
 class FuelDataNotLoadedError(Exception):
@@ -62,11 +71,13 @@ class NoFeasibleFuelPlanError(Exception):
         self.gap_end_miles = round(cause.gap_end_miles, 1)
         self.reachable_miles = round(cause.reachable_miles, 1)
         self.corridor_miles = corridor_miles
+        # Worded to stay true when the gap itself is short but the stations bounding it lie
+        # off the route: the drive out to them counts against the range too.
         super().__init__(
-            f"No fuel station within {corridor_miles:g} miles of the route between mile "
-            f"{self.gap_start_miles} and mile {self.gap_end_miles}, a stretch longer than the "
-            f"{self.reachable_miles}-mile planning range. (Routes that leave the United "
-            "States for long stretches cannot be served: the fuel data is US-only.)"
+            f"The route cannot be covered: between mile {self.gap_start_miles} and mile "
+            f"{self.gap_end_miles} no fuel station within {corridor_miles:g} miles of it can be "
+            f"reached on the {self.reachable_miles}-mile planning range, counting the drive to "
+            "stations off the route. The fuel data has no usable station there."
         )
 
 
@@ -132,7 +143,9 @@ class RoutePlan:
 
     fuel_purchased_cost: Decimal
     gallons_purchased: Decimal
-    trip_fuel_gallons: Decimal  # distance / mpg
+    # Miles driven off the route to reach the stops; only charged in a widened corridor.
+    detour_miles: float
+    trip_fuel_gallons: Decimal  # (distance + detour_miles) / mpg
     starting_fuel_gallons_used: Decimal  # trip_fuel_gallons - gallons_purchased
     starting_fuel_cost_estimate: Decimal
     reference_price: Decimal
@@ -176,8 +189,9 @@ class RoutePlanner:
 
         origin = self._resolver.resolve(start)
         destination = self._resolver.resolve(finish)
-        if origin.coordinate == destination.coordinate:
-            raise SameLocationError
+        if _route_key(origin.coordinate) == _route_key(destination.coordinate):
+            # Same point at the precision the router is asked with.
+            raise SameLocationError(origin.label)
 
         route, points, display_geometry, routing_calls, upstream_ms = self._load_route(
             origin, destination
@@ -186,20 +200,23 @@ class RoutePlanner:
         # Mile markers come from the route geometry, rescaled so that the last one
         # equals the provider's own road distance (haversine over vertices drifts ~0.1%).
         miles = geometry.cumulative_miles(points)
-        if miles[-1] > 0:
-            miles *= route.distance_miles / miles[-1]
+        if route.distance_miles < _MIN_TRIP_MILES or miles[-1] <= 0:
+            # Distinct inputs that snap to the same spot on the road.
+            raise SameLocationError(origin.label)
+        miles *= route.distance_miles / miles[-1]
         samples, sample_miles = geometry.resample(points, miles, self._options.sample_spacing_miles)
 
         penalty = self._options.stop_penalty_usd if stop_penalty is None else stop_penalty
         candidates, purchases, corridor = self._plan_purchases(
             samples, sample_miles, route.distance_miles, penalty
         )
+        widened = corridor > self._options.corridor_tiers_miles[0]
 
         stops = self._price(purchases, candidates)
         purchased_cost = _total_cost(stops)
         gallons_purchased = sum((stop.gallons for stop in stops), Decimal("0.00"))
         if penalty > 0 and stops:
-            cheapest = self._optimise(candidates, route.distance_miles, stop_penalty=0.0)
+            cheapest = self._optimise(candidates, route.distance_miles, 0.0, widened)
             # Both figures are sums of per-stop rounded lines, so the lower bound could land
             # a cent or two above the plan it bounds; never report it that way.
             cheapest_cost = min(_total_cost(self._price(cheapest, candidates)), purchased_cost)
@@ -208,7 +225,16 @@ class RoutePlanner:
 
         # The trip burns distance / mpg. Whatever was not bought on the way came out of
         # the starting tank, so the two parts always add up to the trip's fuel.
-        trip_gallons = _quantize(route.distance_miles / self._vehicle.miles_per_gallon, _HUNDREDTH)
+        # In a widened corridor the stations are really off the route, so driving to each
+        # pump and back is part of the trip.
+        detour_miles = (
+            2 * sum(float(candidates.off_route_miles[p.index]) for p in purchases)
+            if widened
+            else 0.0
+        )
+        trip_gallons = _quantize(
+            (route.distance_miles + detour_miles) / self._vehicle.miles_per_gallon, _HUNDREDTH
+        )
         starting_used = max(trip_gallons - gallons_purchased, Decimal("0.00"))
 
         optional_top_up = None
@@ -231,12 +257,13 @@ class RoutePlanner:
             basis = REFERENCE_DATASET_AVERAGE
         starting_cost = (starting_used * reference_price).quantize(_CENT, ROUND_HALF_UP)
 
-        warnings = []
-        if corridor > self._options.corridor_tiers_miles[0]:
+        warnings = [note for note in (origin.note, destination.note) if note]
+        if widened:
             warnings.append(
                 f"No workable plan within {self._options.corridor_tiers_miles[0]:g} miles of the "
-                f"route; stations up to {corridor:g} miles away were considered. Detour mileage "
-                "is not included in the fuel figures."
+                f"route; stations up to {corridor:g} miles away were considered. The detours to "
+                f"the chosen stops ({detour_miles:.0f} miles in total) are included in the plan "
+                "and in the fuel figures."
             )
 
         plan = RoutePlan(
@@ -249,6 +276,7 @@ class RoutePlanner:
             optional_top_up=optional_top_up,
             fuel_purchased_cost=purchased_cost,
             gallons_purchased=gallons_purchased,
+            detour_miles=detour_miles,
             trip_fuel_gallons=trip_gallons,
             starting_fuel_gallons_used=starting_used,
             starting_fuel_cost_estimate=starting_cost,
@@ -294,11 +322,7 @@ class RoutePlanner:
         coast-to-coast route), which would otherwise dominate cache-hit requests.
         """
         a, b = origin.coordinate, destination.coordinate
-        # 5 decimal places is ~1 m: inputs that close share a route.
-        cache_key = (
-            f"route:{self._routing.name}:{a.latitude:.5f},{a.longitude:.5f}:"
-            f"{b.latitude:.5f},{b.longitude:.5f}"
-        )
+        cache_key = f"route:{self._routing.name}:{_route_key(a)}:{_route_key(b)}"
         cached = self._cache.get(cache_key)
         if cached is not None:
             route, display_geometry = cached
@@ -322,20 +346,32 @@ class RoutePlanner:
     def _plan_purchases(
         self, samples: np.ndarray, sample_miles: np.ndarray, distance: float, penalty: float
     ) -> tuple[RouteMatches, list[Purchase], float]:
-        """Optimise within the narrowest corridor that yields a feasible plan."""
+        """Optimise within the narrowest corridor that yields a feasible plan.
+
+        Inside the first (default) corridor a station's distance from the route is
+        mostly geocoding noise, since stations are placed at city centroids, and
+        it is ignored. Once the corridor has to be widened that is no longer
+        true, so the detour to each pump and back is charged as real driving;
+        otherwise the returned plan could run the tank dry.
+        """
         tiers = self._options.corridor_tiers_miles
         for corridor in tiers:
             matches = self._stations.match_route(samples, sample_miles, corridor)
-            candidates = self._cheapest_per_mile_marker(matches)
+            candidates = self._one_per_town(matches, keep_nearest=corridor > tiers[0])
             try:
-                return candidates, self._optimise(candidates, distance, penalty), corridor
+                purchases = self._optimise(candidates, distance, penalty, corridor > tiers[0])
+                return candidates, purchases, corridor
             except InfeasibleRouteError as exc:
                 if corridor == tiers[-1]:
                     raise NoFeasibleFuelPlanError(exc, corridor) from exc
         raise AssertionError("corridor_tiers_miles must not be empty")
 
     def _optimise(
-        self, candidates: RouteMatches, distance: float, stop_penalty: float
+        self,
+        candidates: RouteMatches,
+        distance: float,
+        stop_penalty: float,
+        charge_detours: bool,
     ) -> list[Purchase]:
         return plan_fuel_stops(
             candidates.mile_markers.tolist(),
@@ -346,22 +382,42 @@ class RoutePlanner:
             miles_per_gallon=self._vehicle.miles_per_gallon,
             start_fuel_gallons=self._vehicle.usable_gallons,  # departs full
             stop_penalty=stop_penalty,
+            detours=candidates.off_route_miles.tolist() if charge_detours else None,
         )
 
-    def _cheapest_per_mile_marker(self, matches: RouteMatches) -> RouteMatches:
-        """Keep only the cheapest station at each mile marker.
+    def _one_per_town(self, matches: RouteMatches, keep_nearest: bool) -> RouteMatches:
+        """Keep only the stations at each mile marker that can matter.
 
         Stations are geocoded to city centroids, so every truck stop in a town
-        lands on the same marker. Only the cheapest of them can ever be part of
-        an optimal plan, so dropping the rest is lossless and hands the
-        optimiser the strictly increasing positions it requires.
+        lands on the same marker. With detours ignored, only the cheapest of
+        them can ever be part of an optimal plan, so dropping the rest is
+        lossless and hands the optimiser the strictly increasing positions it
+        requires.
+
+        When detours are charged (``keep_nearest``) the cheapest may be the one
+        that is too far to reach, so the nearest is kept as well. Its marker is
+        nudged by a hair to keep positions strictly increasing.
         """
         if not len(matches):
             return matches
         prices = self._stations.prices[matches.station_indices]
-        order = np.lexsort((prices, matches.mile_markers))  # by marker, then price
-        first_of_marker = np.concatenate(([True], np.diff(matches.mile_markers[order]) > 0))
-        return matches.take(order[first_of_marker])
+        # Equal prices are common within one chain; the nearer pump then wins the tie.
+        cheapest = _first_per_marker(matches.mile_markers, prices, matches.off_route_miles)
+        if not keep_nearest:
+            return matches.take(cheapest)
+
+        nearest = _first_per_marker(matches.mile_markers, matches.off_route_miles)
+        keep = np.unique(np.concatenate((cheapest, nearest)))
+        chosen = matches.take(
+            keep[np.lexsort((matches.off_route_miles[keep], matches.mile_markers[keep]))]
+        )
+        shares_marker = np.concatenate(([False], np.diff(chosen.mile_markers) == 0))
+        return RouteMatches(
+            chosen.station_indices,
+            chosen.mile_markers + shares_marker * _MARKER_NUDGE_MILES,
+            chosen.off_route_miles,
+            chosen.route_points,
+        )
 
     def _station_on_route(self, candidates: RouteMatches, index: int) -> StationOnRoute:
         return StationOnRoute(
@@ -395,6 +451,20 @@ class RoutePlanner:
                 )
             )
         return stops
+
+
+def _first_per_marker(
+    markers: np.ndarray, rank: np.ndarray, tie_break: np.ndarray | None = None
+) -> np.ndarray:
+    """Index of the lowest-``rank`` entry at each distinct marker, in marker order."""
+    keys = (rank, markers) if tie_break is None else (tie_break, rank, markers)
+    order = np.lexsort(keys)
+    return order[np.concatenate(([True], np.diff(markers[order]) > 0))]
+
+
+def _route_key(coordinate: Coordinate) -> str:
+    """Coordinates as used to identify a route: 5 decimal places is about one metre."""
+    return f"{coordinate.latitude:.5f},{coordinate.longitude:.5f}"
 
 
 def _total_cost(stops: list[FuelStop]) -> Decimal:
